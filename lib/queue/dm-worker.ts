@@ -605,19 +605,28 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           data: {
             status: "PENDING",
             matchedKeyword: matchResult.matchedKeyword,
-            errorMessage: "Hourly rate limit hit; retry scheduled",
+            errorMessage: rateLimit.countsAsRequeue
+              ? "Hourly rate limit hit; retry scheduled"
+              : "Per-minute burst limit hit; retry scheduled",
           },
         });
 
+        // A per-minute block keeps the attempt count, so its job id needs a
+        // timestamp to differ from the job that is running now.
+        const nextAttempt = rateLimit.countsAsRequeue
+          ? requeueAttempt + 1
+          : requeueAttempt;
         await getDMQueue().add(
           "process-comment",
           {
             ...job.data,
-            requeueAttempt: requeueAttempt + 1,
+            requeueAttempt: nextAttempt,
           },
           {
             delay: rateLimit.requeueDelayMs,
-            jobId: `comment_${instagramAccountId}_${commentId}_retry_${requeueAttempt + 1}`,
+            jobId: rateLimit.countsAsRequeue
+              ? `comment_${instagramAccountId}_${commentId}_retry_${nextAttempt}`
+              : `comment_${instagramAccountId}_${commentId}_retry_${nextAttempt}_burst_${Date.now()}`,
           }
         );
         continue;

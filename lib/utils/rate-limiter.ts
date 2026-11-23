@@ -9,17 +9,24 @@
  * requeues rather than pushing through.
  * https://developers.facebook.com/docs/graph-api/overview/rate-limiting/
  *
- * Note this is a hard ceiling with no headroom. If Meta throttles before the
- * documented limit, or other calls on the same account share the bucket, lower
- * this value.
+ * We run far below that ceiling: the account was checkpointed for "account
+ * integrity" on 2026-11-20 while the bot fired bursts of identical DMs, so the
+ * caps below are about looking human, not about Meta's API quota. Real peak was
+ * 72 sent in one hour (2026-11-22). A second, per-minute bucket stops a viral
+ * post from emptying the hourly allowance in one burst.
  */
 
 import Redis from "ioredis";
 
-const RATE_LIMIT_MAX = 750; // private replies per hour, per Meta's documented cap
+const RATE_LIMIT_MAX = 40; // DMs per hour per account (Meta allows 750)
 const RATE_LIMIT_WINDOW = 3600; // 1 hour in seconds
-const REQUEUE_DELAY_MS = 30 * 60 * 1000; // 30 minutes
-const MAX_REQUEUE_ATTEMPTS = 3;
+const BURST_LIMIT_MAX = 4; // DMs per minute per account
+const BURST_LIMIT_WINDOW = 60;
+const REQUEUE_DELAY_MS = 30 * 60 * 1000; // fallback when the window TTL is unknown
+const REQUEUE_JITTER_MS = 60 * 1000; // spread requeued jobs so they don't all fire together
+// Hourly requeues only; a backlog drains at RATE_LIMIT_MAX/h, so 24 tries keeps
+// a comment alive for about a day before it is skipped.
+const MAX_REQUEUE_ATTEMPTS = 24;
 
 let redis: Redis | null = null;
 
@@ -40,24 +47,49 @@ export interface RateLimitResult {
   requeueDelayMs: number;
   shouldSkip: boolean;
   reserved: boolean;
+  // false for a per-minute block: the job retries in a minute without using up
+  // one of its MAX_REQUEUE_ATTEMPTS.
+  countsAsRequeue: boolean;
 }
 
+// Returns {allowed, hourCount, remaining, blockedBy, ttlSeconds}.
+// blockedBy: 0 = allowed, 1 = hourly cap, 2 = per-minute cap.
 const RESERVE_DM_SLOT_SCRIPT = `
-local current = tonumber(redis.call("GET", KEYS[1]) or "0")
-local max = tonumber(ARGV[1])
-local ttl = tonumber(ARGV[2])
+local hour = tonumber(redis.call("GET", KEYS[1]) or "0")
+local minute = tonumber(redis.call("GET", KEYS[2]) or "0")
+local hour_max = tonumber(ARGV[1])
+local minute_max = tonumber(ARGV[3])
 
-if current >= max then
-  return {0, current, 0}
+if hour >= hour_max then
+  return {0, hour, 0, 1, redis.call("TTL", KEYS[1])}
+end
+if minute >= minute_max then
+  return {0, hour, hour_max - hour, 2, redis.call("TTL", KEYS[2])}
 end
 
 local next_count = redis.call("INCR", KEYS[1])
 if next_count == 1 then
-  redis.call("EXPIRE", KEYS[1], ttl)
+  redis.call("EXPIRE", KEYS[1], tonumber(ARGV[2]))
+end
+if redis.call("INCR", KEYS[2]) == 1 then
+  redis.call("EXPIRE", KEYS[2], tonumber(ARGV[4]))
 end
 
-return {1, next_count, max - next_count}
+return {1, next_count, hour_max - next_count, 0, 0}
 `;
+
+function hourKey(instagramAccountId: string) {
+  return `rate:dm:${instagramAccountId}`;
+}
+
+function minuteKey(instagramAccountId: string) {
+  return `rate:dm:min:${instagramAccountId}`;
+}
+
+function requeueDelay(ttlSeconds: number) {
+  const base = ttlSeconds > 0 ? ttlSeconds * 1000 : REQUEUE_DELAY_MS;
+  return base + Math.floor(Math.random() * REQUEUE_JITTER_MS);
+}
 
 function toScriptNumber(value: unknown): number {
   if (typeof value === "number") return value;
@@ -67,7 +99,8 @@ function toScriptNumber(value: unknown): number {
 
 function blockedResult(
   count: number,
-  requeueAttempt: number
+  requeueAttempt: number,
+  ttlSeconds: number = 0
 ): RateLimitResult {
   if (requeueAttempt >= MAX_REQUEUE_ATTEMPTS) {
     return {
@@ -78,6 +111,7 @@ function blockedResult(
       requeueDelayMs: 0,
       shouldSkip: true,
       reserved: false,
+      countsAsRequeue: true,
     };
   }
 
@@ -86,9 +120,10 @@ function blockedResult(
     currentCount: count,
     remainingDMs: 0,
     shouldRequeue: true,
-    requeueDelayMs: REQUEUE_DELAY_MS,
+    requeueDelayMs: requeueDelay(ttlSeconds),
     shouldSkip: false,
     reserved: false,
+    countsAsRequeue: true,
   };
 }
 
@@ -113,29 +148,7 @@ export async function checkRateLimit(
   const count = currentCount ? parseInt(currentCount, 10) : 0;
 
   if (count >= RATE_LIMIT_MAX) {
-    // Over the limit
-    if (requeueAttempt >= MAX_REQUEUE_ATTEMPTS) {
-      // Exceeded max requeue attempts — skip this DM
-      return {
-        allowed: false,
-        currentCount: count,
-        remainingDMs: 0,
-        shouldRequeue: false,
-        requeueDelayMs: 0,
-        shouldSkip: true,
-        reserved: false,
-      };
-    }
-
-    return {
-      allowed: false,
-      currentCount: count,
-      remainingDMs: 0,
-      shouldRequeue: true,
-      requeueDelayMs: REQUEUE_DELAY_MS,
-      shouldSkip: false,
-      reserved: false,
-    };
+    return blockedResult(count, requeueAttempt);
   }
 
   return {
@@ -146,6 +159,7 @@ export async function checkRateLimit(
     requeueDelayMs: 0,
     shouldSkip: false,
     reserved: false,
+    countsAsRequeue: false,
   };
 }
 
@@ -159,22 +173,39 @@ export async function reserveDMSlot(
   requeueAttempt: number = 0
 ): Promise<RateLimitResult> {
   const client = getRedis();
-  const key = `rate:dm:${instagramAccountId}`;
 
   const result = await client.eval(
     RESERVE_DM_SLOT_SCRIPT,
-    1,
-    key,
+    2,
+    hourKey(instagramAccountId),
+    minuteKey(instagramAccountId),
     RATE_LIMIT_MAX,
-    RATE_LIMIT_WINDOW
+    RATE_LIMIT_WINDOW,
+    BURST_LIMIT_MAX,
+    BURST_LIMIT_WINDOW
   );
   const values = Array.isArray(result) ? result : [];
   const allowedFlag = toScriptNumber(values[0]);
   const count = toScriptNumber(values[1]);
   const remaining = toScriptNumber(values[2]);
+  const blockedBy = toScriptNumber(values[3]);
+  const ttlSeconds = toScriptNumber(values[4]);
 
   if (allowedFlag !== 1) {
-    return blockedResult(count, requeueAttempt);
+    if (blockedBy === 2) {
+      // Per-minute burst cap: wait out the minute, never skip for this.
+      return {
+        allowed: false,
+        currentCount: count,
+        remainingDMs: remaining,
+        shouldRequeue: true,
+        requeueDelayMs: requeueDelay(ttlSeconds),
+        shouldSkip: false,
+        reserved: false,
+        countsAsRequeue: false,
+      };
+    }
+    return blockedResult(count, requeueAttempt, ttlSeconds);
   }
 
   return {
@@ -185,6 +216,7 @@ export async function reserveDMSlot(
     requeueDelayMs: 0,
     shouldSkip: false,
     reserved: true,
+    countsAsRequeue: false,
   };
 }
 
@@ -206,8 +238,9 @@ export async function reserveDMSlot(
 export async function releaseDMSlot(
   instagramAccountId: string
 ): Promise<number> {
+  // Only the hourly slot is handed back; the minute slot just expires.
   const client = getRedis();
-  const key = `rate:dm:${instagramAccountId}`;
+  const key = hourKey(instagramAccountId);
   const next = await client.decr(key);
   if (next < 0) {
     await client.del(key);
@@ -251,4 +284,11 @@ export async function resetRateLimit(
 }
 
 // Export constants for use in tests
-export { RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, REQUEUE_DELAY_MS, MAX_REQUEUE_ATTEMPTS };
+export {
+  RATE_LIMIT_MAX,
+  RATE_LIMIT_WINDOW,
+  BURST_LIMIT_MAX,
+  BURST_LIMIT_WINDOW,
+  REQUEUE_DELAY_MS,
+  MAX_REQUEUE_ATTEMPTS,
+};

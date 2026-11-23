@@ -261,6 +261,7 @@ beforeEach(() => {
     requeueDelayMs: 0,
     shouldSkip: false,
     reserved: true,
+    countsAsRequeue: false,
   });
   mockReleaseDMSlot.mockResolvedValue(0);
   mockReleaseWorkspaceDMReservation.mockResolvedValue({ count: 1 });
@@ -440,6 +441,7 @@ describe("DM Worker — Full Pipeline", () => {
       requeueDelayMs: 1800000,
       shouldSkip: false,
       reserved: false,
+      countsAsRequeue: true,
     });
 
     const processor = getProcessor();
@@ -472,6 +474,7 @@ describe("DM Worker — Full Pipeline", () => {
       requeueDelayMs: 0,
       shouldSkip: true,
       reserved: false,
+      countsAsRequeue: true,
     });
 
     const processor = getProcessor();

@@ -35,6 +35,8 @@ import {
   reserveDMSlot,
   releaseDMSlot,
   RATE_LIMIT_MAX,
+  BURST_LIMIT_MAX,
+  MAX_REQUEUE_ATTEMPTS,
 } from "../lib/utils/rate-limiter";
 
 beforeEach(() => {
@@ -43,13 +45,13 @@ beforeEach(() => {
 
 describe("checkRateLimit", () => {
   it("should allow when count is below limit", async () => {
-    mockGet.mockResolvedValue("50");
+    mockGet.mockResolvedValue("5");
 
     const result = await checkRateLimit("account_123");
 
     expect(result.allowed).toBe(true);
-    expect(result.currentCount).toBe(50);
-    expect(result.remainingDMs).toBe(RATE_LIMIT_MAX - 50);
+    expect(result.currentCount).toBe(5);
+    expect(result.remainingDMs).toBe(RATE_LIMIT_MAX - 5);
     expect(result.shouldRequeue).toBe(false);
     expect(result.shouldSkip).toBe(false);
     expect(result.reserved).toBe(false);
@@ -78,7 +80,7 @@ describe("checkRateLimit", () => {
   it("should skip after max requeue attempts", async () => {
     mockGet.mockResolvedValue(String(RATE_LIMIT_MAX));
 
-    const result = await checkRateLimit("account_123", 3);
+    const result = await checkRateLimit("account_123", MAX_REQUEUE_ATTEMPTS);
 
     expect(result.allowed).toBe(false);
     expect(result.shouldRequeue).toBe(false);
@@ -88,25 +90,28 @@ describe("checkRateLimit", () => {
 
 describe("reserveDMSlot", () => {
   it("should atomically reserve a slot when below the hourly cap", async () => {
-    mockEval.mockResolvedValue([1, 51, 139]);
+    mockEval.mockResolvedValue([1, 11, 29, 0, 0]);
 
     const result = await reserveDMSlot("account_123");
 
     expect(mockEval).toHaveBeenCalledWith(
       expect.any(String),
-      1,
+      2,
       "rate:dm:account_123",
+      "rate:dm:min:account_123",
       RATE_LIMIT_MAX,
-      3600
+      3600,
+      BURST_LIMIT_MAX,
+      60
     );
     expect(result.allowed).toBe(true);
     expect(result.reserved).toBe(true);
-    expect(result.currentCount).toBe(51);
-    expect(result.remainingDMs).toBe(139);
+    expect(result.currentCount).toBe(11);
+    expect(result.remainingDMs).toBe(29);
   });
 
   it("should recommend requeue when the atomic reserve is denied", async () => {
-    mockEval.mockResolvedValue([0, RATE_LIMIT_MAX, 0]);
+    mockEval.mockResolvedValue([0, RATE_LIMIT_MAX, 0, 1, 1200]);
 
     const result = await reserveDMSlot("account_123", 0);
 
@@ -114,12 +119,29 @@ describe("reserveDMSlot", () => {
     expect(result.reserved).toBe(false);
     expect(result.shouldRequeue).toBe(true);
     expect(result.shouldSkip).toBe(false);
+    expect(result.countsAsRequeue).toBe(true);
+    // waits for the hourly window to reset, plus jitter under a minute
+    expect(result.requeueDelayMs).toBeGreaterThanOrEqual(1_200_000);
+    expect(result.requeueDelayMs).toBeLessThan(1_260_000);
+  });
+
+  it("retries a per-minute burst block soon without spending an attempt", async () => {
+    mockEval.mockResolvedValue([0, 10, 30, 2, 20]);
+
+    const result = await reserveDMSlot("account_123", MAX_REQUEUE_ATTEMPTS);
+
+    expect(result.allowed).toBe(false);
+    expect(result.shouldRequeue).toBe(true);
+    expect(result.shouldSkip).toBe(false);
+    expect(result.countsAsRequeue).toBe(false);
+    expect(result.requeueDelayMs).toBeGreaterThanOrEqual(20_000);
+    expect(result.requeueDelayMs).toBeLessThan(80_000);
   });
 
   it("should skip after max requeue attempts", async () => {
-    mockEval.mockResolvedValue(["0", String(RATE_LIMIT_MAX), "0"]);
+    mockEval.mockResolvedValue(["0", String(RATE_LIMIT_MAX), "0", "1", "100"]);
 
-    const result = await reserveDMSlot("account_123", 3);
+    const result = await reserveDMSlot("account_123", MAX_REQUEUE_ATTEMPTS);
 
     expect(result.allowed).toBe(false);
     expect(result.shouldRequeue).toBe(false);
@@ -129,12 +151,12 @@ describe("reserveDMSlot", () => {
 
 describe("incrementDMCounter", () => {
   it("should use the atomic reservation path", async () => {
-    mockEval.mockResolvedValue([1, 51, 139]);
+    mockEval.mockResolvedValue([1, 11, 29, 0, 0]);
 
     const count = await incrementDMCounter("account_123");
 
     expect(mockEval).toHaveBeenCalled();
-    expect(count).toBe(51);
+    expect(count).toBe(11);
   });
 });
 
